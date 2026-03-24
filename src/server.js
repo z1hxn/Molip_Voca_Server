@@ -1,6 +1,7 @@
 import dotenv from 'dotenv'
 import cors from 'cors'
 import express from 'express'
+import cookieParser from 'cookie-parser'
 import { createClient } from '@supabase/supabase-js'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -26,6 +27,10 @@ const {
   FRONTEND_ORIGINS = '',
   SUPABASE_URL,
   SUPABASE_ANON_KEY,
+  AUTH_COOKIE_NAME = 'molip_token',
+  AUTH_COOKIE_DOMAIN = '',
+  AUTH_COOKIE_MAX_AGE_MS = String(1000 * 60 * 60 * 24 * 7),
+  AUTH_COOKIE_SECURE = '',
 } = process.env
 
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
@@ -60,14 +65,17 @@ app.use(cors({
       return
     }
 
-    if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+    if (allowedOrigins.includes(origin)) {
       callback(null, true)
       return
     }
 
     callback(new Error('Not allowed by CORS'))
   },
+  credentials: true,
 }))
+app.set('trust proxy', 1)
+app.use(cookieParser())
 app.use(express.json())
 
 const createUserClient = (token) => createSupabaseClient(token)
@@ -78,8 +86,48 @@ const getBearerToken = (req) => {
   return auth.slice(7)
 }
 
+const isCookieSecure = AUTH_COOKIE_SECURE
+  ? AUTH_COOKIE_SECURE === 'true'
+  : process.env.NODE_ENV === 'production'
+
+const resolveCookieBaseOptions = () => {
+  const base = {
+    httpOnly: true,
+    secure: isCookieSecure,
+    sameSite: isCookieSecure ? 'none' : 'lax',
+    path: '/',
+  }
+
+  if (AUTH_COOKIE_DOMAIN) {
+    return { ...base, domain: AUTH_COOKIE_DOMAIN }
+  }
+
+  return base
+}
+
+const setAuthCookie = (res, token) => {
+  res.cookie(AUTH_COOKIE_NAME, token, {
+    ...resolveCookieBaseOptions(),
+    maxAge: Number(AUTH_COOKIE_MAX_AGE_MS || 0),
+  })
+}
+
+const clearAuthCookie = (res) => {
+  res.clearCookie(AUTH_COOKIE_NAME, resolveCookieBaseOptions())
+}
+
+const getRequestToken = (req) => {
+  const bearerToken = getBearerToken(req)
+  if (bearerToken) return { token: bearerToken, source: 'header' }
+
+  const cookieToken = req.cookies?.[AUTH_COOKIE_NAME]
+  if (cookieToken) return { token: cookieToken, source: 'cookie' }
+
+  return { token: null, source: 'none' }
+}
+
 const authRequired = async (req, res, next) => {
-  const token = getBearerToken(req)
+  const { token, source } = getRequestToken(req)
   if (!token) {
     res.status(401).json({ message: 'Unauthorized' })
     return
@@ -93,11 +141,15 @@ const authRequired = async (req, res, next) => {
 
   req.user = data.user
   req.supabase = createUserClient(token)
+  req.authToken = token
+  if (source === 'header') {
+    setAuthCookie(res, token)
+  }
   next()
 }
 
 const authOptional = async (req, _res, next) => {
-  const token = getBearerToken(req)
+  const { token } = getRequestToken(req)
   if (!token) {
     req.user = null
     req.supabase = publicSupabase
@@ -181,6 +233,20 @@ const clearApiCache = () => {
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true })
+})
+
+app.post('/api/auth/session', authRequired, (req, res) => {
+  if (!req.authToken) {
+    res.status(401).json({ message: 'Unauthorized' })
+    return
+  }
+  setAuthCookie(res, req.authToken)
+  res.status(204).end()
+})
+
+app.post('/api/auth/logout', (_req, res) => {
+  clearAuthCookie(res)
+  res.status(204).end()
 })
 
 app.get('/api/auth/me', authRequired, async (req, res) => {
