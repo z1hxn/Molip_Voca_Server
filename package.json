@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --watch src/server.js",
+    "dev": "node src/server.js",
+    "dev:watch": "node --watch src/server.js",
     "start": "node src/server.js"
   },
   "dependencies": {

@@ -23,6 +23,7 @@ envCandidates.forEach((envPath) => {
 const {
   PORT = '4000',
   FRONTEND_ORIGIN = 'http://localhost:5173',
+  FRONTEND_ORIGINS = '',
   SUPABASE_URL,
   SUPABASE_ANON_KEY,
 } = process.env
@@ -47,7 +48,26 @@ const createSupabaseClient = (token) => createClient(SUPABASE_URL, SUPABASE_ANON
 
 const publicSupabase = createSupabaseClient()
 
-app.use(cors({ origin: FRONTEND_ORIGIN }))
+const allowedOrigins = (FRONTEND_ORIGINS || FRONTEND_ORIGIN)
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean)
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) {
+      callback(null, true)
+      return
+    }
+
+    if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+      callback(null, true)
+      return
+    }
+
+    callback(new Error('Not allowed by CORS'))
+  },
+}))
 app.use(express.json())
 
 const createUserClient = (token) => createSupabaseClient(token)
@@ -100,6 +120,63 @@ const authOptional = async (req, _res, next) => {
 
 const sendError = (res, error, status = 400) => {
   res.status(status).json({ message: error?.message || 'Request failed' })
+}
+
+const SHARE_SCOPES = new Set(['private', 'unlisted', 'public'])
+
+const normalizeShareScope = (scope, isPublicFallback = false) => {
+  if (typeof scope === 'string' && SHARE_SCOPES.has(scope)) {
+    return scope
+  }
+  return isPublicFallback ? 'public' : 'private'
+}
+
+const deriveIsPublic = (shareScope) => shareScope !== 'private'
+
+const normalizeMeaningValue = (value) => String(value || '')
+  .split(',')
+  .map((part) => part.trim())
+  .filter(Boolean)
+  .join(', ')
+
+const withShareScope = (row) => {
+  if (!row) return row
+  const shareScope = normalizeShareScope(row.share_scope, Boolean(row.is_public))
+  return {
+    ...row,
+    share_scope: shareScope,
+    is_public: deriveIsPublic(shareScope),
+  }
+}
+
+const isShareScopeColumnMissing = (error) => {
+  if (!error) return false
+  const message = String(error.message || '').toLowerCase()
+  return error.code === '42703' || message.includes('share_scope')
+}
+
+const API_CACHE_TTL_MS = Number(process.env.API_CACHE_TTL_MS || 7000)
+const apiCache = new Map()
+
+const getCachedJson = (key) => {
+  const cached = apiCache.get(key)
+  if (!cached) return null
+  if (cached.expiresAt <= Date.now()) {
+    apiCache.delete(key)
+    return null
+  }
+  return cached.value
+}
+
+const setCachedJson = (key, value, ttl = API_CACHE_TTL_MS) => {
+  apiCache.set(key, {
+    value,
+    expiresAt: Date.now() + Math.max(0, ttl),
+  })
+}
+
+const clearApiCache = () => {
+  apiCache.clear()
 }
 
 app.get('/api/health', (_req, res) => {
@@ -239,6 +316,64 @@ app.delete('/api/folders/:id', authRequired, async (req, res) => {
   res.status(204).end()
 })
 
+app.get('/api/community/vocas', authRequired, async (req, res) => {
+  const cached = getCachedJson('community:v1')
+  if (cached) {
+    res.json(cached)
+    return
+  }
+
+  let communityRows = null
+  let communityError = null
+
+  ;({ data: communityRows, error: communityError } = await req.supabase
+    .from('voca_sets')
+    .select('*')
+    .eq('share_scope', 'public')
+    .order('updated_at', { ascending: false })
+    .limit(120))
+
+  if (communityError && isShareScopeColumnMissing(communityError)) {
+    ;({ data: communityRows, error: communityError } = await req.supabase
+      .from('voca_sets')
+      .select('*')
+      .eq('is_public', true)
+      .order('updated_at', { ascending: false })
+      .limit(120))
+  }
+
+  if (communityError) {
+    sendError(res, communityError)
+    return
+  }
+
+  const rows = communityRows || []
+  const ownerIds = [...new Set(rows.map((item) => item.owner_id).filter(Boolean))]
+  let ownerMap = new Map()
+
+  if (ownerIds.length > 0) {
+    const { data: profiles, error: profilesError } = await req.supabase
+      .schema('public')
+      .from('profiles')
+      .select('id, username, email')
+      .in('id', ownerIds)
+
+    if (!profilesError && profiles) {
+      ownerMap = new Map(
+        profiles.map((profile) => [profile.id, { username: profile.username, email: profile.email }])
+      )
+    }
+  }
+
+  const data = rows.map((row) => withShareScope({
+    ...row,
+    owner: ownerMap.get(row.owner_id),
+  }))
+
+  setCachedJson('community:v1', data)
+  res.json(data)
+})
+
 app.get('/api/vocas', authRequired, async (req, res) => {
   const folderId = req.query.folderId
 
@@ -253,7 +388,7 @@ app.get('/api/vocas', authRequired, async (req, res) => {
       sendError(res, error)
       return
     }
-    res.json(data || [])
+    res.json((data || []).map(withShareScope))
     return
   }
 
@@ -297,7 +432,7 @@ app.get('/api/vocas', authRequired, async (req, res) => {
   const deduped = Array.from(new Map(merged.map((voca) => [voca.id, voca])).values())
     .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
 
-  res.json(deduped)
+  res.json(deduped.map(withShareScope))
 })
 
 app.get('/api/vocas/:id', authRequired, async (req, res) => {
@@ -315,16 +450,35 @@ app.get('/api/vocas/:id', authRequired, async (req, res) => {
     res.status(404).json({ message: 'Not found' })
     return
   }
-  res.json(data)
+  res.json(withShareScope(data))
 })
 
 app.get('/api/shared/:shareToken', async (req, res) => {
-  const { data, error } = await publicSupabase
+  const cacheKey = `shared:${req.params.shareToken}`
+  const cached = getCachedJson(cacheKey)
+  if (cached) {
+    res.json(cached)
+    return
+  }
+
+  let data = null
+  let error = null
+
+  ;({ data, error } = await publicSupabase
     .from('voca_sets')
     .select('*')
     .eq('share_token', req.params.shareToken)
-    .eq('is_public', true)
-    .maybeSingle()
+    .in('share_scope', ['public', 'unlisted'])
+    .maybeSingle())
+
+  if (error && isShareScopeColumnMissing(error)) {
+    ;({ data, error } = await publicSupabase
+      .from('voca_sets')
+      .select('*')
+      .eq('share_token', req.params.shareToken)
+      .eq('is_public', true)
+      .maybeSingle())
+  }
 
   if (error) {
     sendError(res, error)
@@ -334,7 +488,24 @@ app.get('/api/shared/:shareToken', async (req, res) => {
     res.status(404).json({ message: 'Not found' })
     return
   }
-  res.json(data)
+
+  let owner = null
+  if (data.owner_id) {
+    const { data: ownerProfile, error: ownerError } = await publicSupabase
+      .schema('public')
+      .from('profiles')
+      .select('id, username, email')
+      .eq('id', data.owner_id)
+      .maybeSingle()
+
+    if (!ownerError && ownerProfile) {
+      owner = { username: ownerProfile.username, email: ownerProfile.email }
+    }
+  }
+
+  const responseData = withShareScope({ ...data, owner })
+  setCachedJson(cacheKey, responseData)
+  res.json(responseData)
 })
 
 app.get('/api/vocas/:id/role', authRequired, async (req, res) => {
@@ -383,42 +554,68 @@ app.post('/api/vocas', authRequired, async (req, res) => {
     folder_id: req.body?.folder_id || null,
     title,
     description: String(req.body?.description || ''),
-    is_public: Boolean(req.body?.is_public || false),
+    share_scope: normalizeShareScope(req.body?.share_scope, Boolean(req.body?.is_public)),
+    is_public: deriveIsPublic(normalizeShareScope(req.body?.share_scope, Boolean(req.body?.is_public))),
   }
 
-  const { data, error } = await req.supabase
+  let { data, error } = await req.supabase
     .from('voca_sets')
     .insert(payload)
     .select('id')
     .single()
 
+  if (error && isShareScopeColumnMissing(error)) {
+    const { share_scope, ...legacyPayload } = payload
+    ;({ data, error } = await req.supabase
+      .from('voca_sets')
+      .insert(legacyPayload)
+      .select('id')
+      .single())
+  }
+
   if (error) {
     sendError(res, error)
     return
   }
+  clearApiCache()
   res.status(201).json(data)
 })
 
 app.patch('/api/vocas/:id', authRequired, async (req, res) => {
+  const hasShareSetting = req.body?.share_scope !== undefined || req.body?.is_public !== undefined
+  const nextShareScope = hasShareSetting
+    ? normalizeShareScope(req.body?.share_scope, Boolean(req.body?.is_public))
+    : undefined
+
   const patch = {
     title: req.body?.title,
     description: req.body?.description,
     folder_id: req.body?.folder_id === undefined ? undefined : req.body.folder_id || null,
-    is_public: req.body?.is_public,
+    share_scope: nextShareScope,
+    is_public: nextShareScope === undefined ? undefined : deriveIsPublic(nextShareScope),
     updated_at: new Date().toISOString(),
   }
 
   Object.keys(patch).forEach((key) => patch[key] === undefined && delete patch[key])
 
-  const { error } = await req.supabase
+  let { error } = await req.supabase
     .from('voca_sets')
     .update(patch)
     .eq('id', req.params.id)
+
+  if (error && isShareScopeColumnMissing(error)) {
+    const { share_scope, ...legacyPatch } = patch
+    ;({ error } = await req.supabase
+      .from('voca_sets')
+      .update(legacyPatch)
+      .eq('id', req.params.id))
+  }
 
   if (error) {
     sendError(res, error)
     return
   }
+  clearApiCache()
   res.json({ ok: true })
 })
 
@@ -432,6 +629,7 @@ app.delete('/api/vocas/:id', authRequired, async (req, res) => {
     sendError(res, error)
     return
   }
+  clearApiCache()
   res.status(204).end()
 })
 
@@ -453,17 +651,29 @@ app.post('/api/vocas/:id/clone', authRequired, async (req, res) => {
     return
   }
 
-  const { data: newVoca, error: createError } = await req.supabase
+  const clonePayload = {
+    owner_id: req.user.id,
+    folder_id: null,
+    title: `${original.title} (복사본)`,
+    description: original.description,
+    share_scope: 'private',
+    is_public: false,
+  }
+
+  let { data: newVoca, error: createError } = await req.supabase
     .from('voca_sets')
-    .insert({
-      owner_id: req.user.id,
-      folder_id: null,
-      title: `${original.title} (복사본)`,
-      description: original.description,
-      is_public: false,
-    })
+    .insert(clonePayload)
     .select('id')
     .single()
+
+  if (createError && isShareScopeColumnMissing(createError)) {
+    const { share_scope, ...legacyClonePayload } = clonePayload
+    ;({ data: newVoca, error: createError } = await req.supabase
+      .from('voca_sets')
+      .insert(legacyClonePayload)
+      .select('id')
+      .single())
+  }
 
   if (createError) {
     sendError(res, createError)
@@ -489,6 +699,7 @@ app.post('/api/vocas/:id/clone', authRequired, async (req, res) => {
     }
   }
 
+  clearApiCache()
   res.status(201).json({ id: newVoca.id })
 })
 
@@ -510,7 +721,7 @@ app.post('/api/vocas/:id/words', authRequired, async (req, res) => {
   const payload = {
     voca_id: req.params.id,
     word: String(req.body?.word || '').trim(),
-    meaning: String(req.body?.meaning || '').trim(),
+    meaning: normalizeMeaningValue(req.body?.meaning),
     pos: String(req.body?.pos || ''),
     example: String(req.body?.example || ''),
   }
@@ -543,7 +754,7 @@ app.post('/api/vocas/:id/words/bulk', authRequired, async (req, res) => {
     .map((item) => ({
       voca_id: req.params.id,
       word: String(item.word || '').trim(),
-      meaning: String(item.meaning || '').trim(),
+      meaning: normalizeMeaningValue(item.meaning),
       pos: String(item.pos || ''),
       example: String(item.example || ''),
     }))
@@ -560,7 +771,7 @@ app.post('/api/vocas/:id/words/bulk', authRequired, async (req, res) => {
 app.patch('/api/words/:id', authRequired, async (req, res) => {
   const patch = {
     word: req.body?.word,
-    meaning: req.body?.meaning,
+    meaning: req.body?.meaning === undefined ? undefined : normalizeMeaningValue(req.body?.meaning),
     pos: req.body?.pos,
     example: req.body?.example,
   }
